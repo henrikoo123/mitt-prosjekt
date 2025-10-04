@@ -1,116 +1,164 @@
-import yfinance as yf
+import streamlit as st
 import pandas as pd
 import numpy as np
-import streamlit as st
-from sklearn.ensemble import RandomForestClassifier
+import yfinance as yf
+from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
-from pandas.tseries.offsets import BDay
-import datetime
+from sklearn.metrics import accuracy_score
 
-# --- Streamlit config ---
-st.set_page_config(page_title="🤖 AI Aksje Trader", page_icon="💹", layout="centered")
-st.title("🤖 AI Trader – 10 års historikk + maskinlæring")
-st.write("Denne appen trener en Random Forest på tekniske indikatorer og gir en AI-anbefaling for neste børsdag.")
+# --- App-tittel ---
+st.title("🤖 AI Trader – Historisk analyse + AI-anbefaling")
+st.write("""
+Appen henter 10+ års data, trener en XGBoost-modell på tekniske indikatorer, 
+og gir en AI-basert anbefaling (kjøp, selg eller vent).
+""")
 
-# --- Velg aksjer manuelt (raske og gyldige) ---
-tickere = ["AAPL", "TSLA", "MSFT", "GOOG", "AMZN", "NVDA", "META", "NFLX", "EQNR.OL", "DNB.OL"]
+# --- Brukervalg ---
+ticker = st.selectbox(
+    "Velg ticker:",
+    [
+        "AAPL", "MSFT", "TSLA", "AMZN", "META", "GOOG", "NVDA", "NFLX", "NOVO-B.CO"
+    ],
+    index=0
+)
 
-# --- Input ---
-ticker = st.selectbox("Velg ticker:", tickere, index=0)
 
+st.write("Velg en aksje og trykk **Analyser** for å starte AI-vurderingen.")
+
+# --- Hovedlogikk ---
 if st.button("Analyser"):
-    # --- 1. Hent data ---
-    data = yf.download(ticker, period="10y", interval="1d")
+    st.info(f"Henter historiske data for {ticker} ...")
+    data = yf.download(ticker, start="2010-01-01", progress=False)
 
-    if data.empty:
+    if data is None or data.empty:
         st.error("Kunne ikke hente data for denne tickeren.")
-    else:
-        # --- 2. Beregn indikatorer ---
-        data["SMA_20"] = data["Close"].rolling(window=20).mean()
-        data["SMA_50"] = data["Close"].rolling(window=50).mean()
+        st.stop()
 
-        # RSI
-        delta = data["Close"].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / loss
-        data["RSI"] = 100 - (100 / (1 + rs))
+    # --- Bruk justert sluttkurs hvis tilgjengelig ---
+    data["Close"] = data.get("Adj Close", data["Close"])
 
-        # EMA
-        ema12 = data["Close"].ewm(span=12, adjust=False).mean()
-        ema26 = data["Close"].ewm(span=26, adjust=False).mean()
-        data["EMA_12"] = ema12
-        data["EMA_26"] = ema26
-        data["EMA_Cross"] = (ema12 - ema26)  # positiv = bullish, negativ = bearish
+    # --- RSI ---
+    delta = data["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14, min_periods=1).mean()
+    avg_loss = loss.rolling(14, min_periods=1).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    data["RSI"] = 100 - (100 / (1 + rs))
 
-        # MACD
-        data["MACD"] = ema12 - ema26
+    # --- EMA ---
+    data["EMA_20"] = data["Close"].ewm(span=20, adjust=False).mean()
+    data["EMA_50"] = data["Close"].ewm(span=50, adjust=False).mean()
+    data["EMA_200"] = data["Close"].ewm(span=200, adjust=False).mean()
 
-        # Bollinger Bands
-        data["BB_mid"] = data["Close"].rolling(window=20).mean()
-        data["BB_std"] = data["Close"].rolling(window=20).std()
-        data["BB_upper"] = data["BB_mid"] + 2 * data["BB_std"]
-        data["BB_lower"] = data["BB_mid"] - 2 * data["BB_std"]
+    # --- Bollinger Bands ---
+    bb_mid = data["Close"].rolling(window=20, min_periods=1).mean()
+    bb_std = data["Close"].rolling(window=20, min_periods=1).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    data["BB_%B"] = (data["Close"] - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
 
-        # Volatilitet & momentum
-        data["Volatility"] = data["Close"].pct_change().rolling(20).std()
-        data["Momentum"] = data["Close"].pct_change(10)
-        data["Volume_trend"] = data["Volume"].pct_change().rolling(20).mean()
+    # --- ADX ---
+    high = data["High"].astype(float)
+    low = data["Low"].astype(float)
+    close = data["Close"].astype(float)
 
-        # --- 3. Lag target (opp/ned neste dag) ---
-        fremtid = 5  # antall dager frem
-        data["Target"] = (data["Close"].shift(-fremtid) > data["Close"]).astype(int)
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
 
-        data = data.dropna()
+    tr_components = pd.concat([
+        (high - low),
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1)
+    tr = tr_components.max(axis=1)
+    atr = tr.rolling(14, min_periods=1).mean().replace(0, np.nan)
 
-        # --- 4. Sett opp features og labels ---
-        X = data[[
-            "SMA_20", "SMA_50", "RSI", "MACD", "Volatility",
-            "Momentum", "Volume_trend", "EMA_Cross", "BB_mid", "BB_upper", "BB_lower"
-        ]]
-        y = data["Target"]
+    plus_di = 100 * (plus_dm.rolling(14, min_periods=1).sum() / atr)
+    minus_di = 100 * (minus_dm.rolling(14, min_periods=1).sum() / atr)
+    adx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
 
-        # --- 5. Split data ---
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    if isinstance(adx, pd.DataFrame):
+        adx = adx.iloc[:, 0]
+    adx = pd.Series(adx.values, index=data.index, name="ADX")
+    data["ADX"] = adx.fillna(method="bfill").fillna(method="ffill")
 
-        # --- 6. Tren modell (med class_weight balansert) ---
-        model = RandomForestClassifier(n_estimators=300, random_state=42, class_weight="balanced")
-        model.fit(X_train, y_train)
+    # --- Rens data ---
+    data = data.replace([np.inf, -np.inf], np.nan)
+    data = data.fillna(method="bfill").fillna(method="ffill")
 
-        # --- 7. Evaluer ---
-        y_pred = model.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
-        st.subheader("📊 Modell-evaluering")
-        st.write(f"Treffsikkerhet: **{acc:.2%}**")
-        st.text(classification_report(y_test, y_pred))
+    if len(data) < 100:
+        st.error("For lite data igjen etter indikatorberegninger.")
+        st.stop()
 
-        # --- 8. Feature importance ---
-        importance = pd.DataFrame({
-            "Feature": X.columns,
-            "Importance": model.feature_importances_
-        }).sort_values(by="Importance", ascending=False)
+    # --- Tren og evaluer for flere horisonter ---
+    X = data[["RSI", "EMA_20", "EMA_50", "EMA_200", "BB_%B", "ADX"]]
 
-        st.subheader("🔎 Viktigste indikatorer")
-        st.bar_chart(importance.set_index("Feature"))
-        st.table(importance)
+    results = []
+    best_model = None
+    best_horizon = None
+    best_acc = 0.0
 
-        # --- 9. AI-anbefaling for neste børsdag ---
-        siste = X.iloc[[-1]]
-        sannsynlighet = model.predict_proba(siste)[0, 1]
+    for horizon in [1, 5, 10, 20]:
+        target_col = f"Target_{horizon}d"
+        data[target_col] = np.where(data["Close"].shift(-horizon) > data["Close"], 1, 0)
 
-        neste_borsdag = (datetime.date.today() + BDay(1)).date()
-
-        st.subheader("🤖 AI-anbefaling")
-        st.write(
-            f"Sannsynlighet for oppgang i {ticker} neste børsdag (**{neste_borsdag}**): "
-            f"**{sannsynlighet:.2%}**"
+        y = data[target_col]
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, shuffle=False
         )
 
-        if sannsynlighet > 0.6:
-            st.success("💚 AI sier: **KJØP** (modellen ser høy sannsynlighet for oppgang)")
-        elif sannsynlighet < 0.4:
-            st.error("❤️ AI sier: **SELG** (modellen ser høy sannsynlighet for nedgang)")
-        else:
-            st.warning("⚖️ AI sier: **VENT** (usikkert signal)")
+        model = XGBClassifier(
+            n_estimators=200,
+            learning_rate=0.05,
+            max_depth=4,
+            random_state=42,
+            use_label_encoder=False,
+            eval_metric="logloss"
+        )
+        model.fit(X_train, y_train)
 
+        preds = model.predict(X_test)
+        acc = accuracy_score(y_test, preds)
+
+        results.append({
+            "Horisont": f"{horizon} dager",
+            "Nøyaktighet": f"{acc:.2%}"
+        })
+
+        if acc > best_acc:
+            best_acc = acc
+            best_model = model
+            best_horizon = horizon
+
+    # --- Vis resultat-tabell ---
+    st.subheader("📊 Sammenlikning av ulike tidshorisonter")
+    st.table(pd.DataFrame(results))
+
+    # --- AI-anbefaling basert på beste horisont ---
+    sannsynlighet = best_model.predict_proba(X.iloc[[-1]])[0, 1]
+
+    st.subheader("🤖 AI-anbefaling")
+    if sannsynlighet > 0.6:
+        st.success(
+            f"AI-en vurderer {ticker} som **KJØP** "
+            f"(oppgangssannsynlighet: {sannsynlighet:.1%}, horisont: {best_horizon} dager, "
+            f"modellens treffsikkerhet: {best_acc:.2%}) 📈"
+        )
+    elif sannsynlighet < 0.4:
+        st.error(
+            f"AI-en vurderer {ticker} som **SELGE** "
+            f"(oppgangssannsynlighet: {sannsynlighet:.1%}, horisont: {best_horizon} dager, "
+            f"modellens treffsikkerhet: {best_acc:.2%}) 📉"
+        )
+    else:
+        st.warning(
+            f"AI-en anbefaler **VENT** "
+            f"(oppgangssannsynlighet: {sannsynlighet:.1%}, horisont: {best_horizon} dager, "
+            f"modellens treffsikkerhet: {best_acc:.2%}) ⚖️"
+        )
+
+    st.caption(f"""
+📅 Merk: AI-en testet flere tidshorisonter (1, 5, 10, 20 dager).  
+Denne anbefalingen er basert på **{best_horizon} dager**, som historisk ga høyest treffsikkerhet ({best_acc:.2%}).  
+""")
