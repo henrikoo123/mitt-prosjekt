@@ -5,11 +5,13 @@ import streamlit as st
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
+from pandas.tseries.offsets import BDay
+import datetime
 
 # --- Streamlit config ---
 st.set_page_config(page_title="🤖 AI Aksje Trader", page_icon="💹", layout="centered")
 st.title("🤖 AI Trader – 10 års historikk + maskinlæring")
-st.write("Appen trener en Random Forest på tekniske indikatorer og gir en AI-anbefaling for neste dag.")
+st.write("Denne appen trener en Random Forest på tekniske indikatorer og gir en AI-anbefaling for neste børsdag.")
 
 # --- Velg aksjer manuelt (raske og gyldige) ---
 tickere = ["AAPL", "TSLA", "MSFT", "GOOG", "AMZN", "NVDA", "META", "NFLX", "EQNR.OL", "DNB.OL"]
@@ -28,33 +30,52 @@ if st.button("Analyser"):
         data["SMA_20"] = data["Close"].rolling(window=20).mean()
         data["SMA_50"] = data["Close"].rolling(window=50).mean()
 
+        # RSI
         delta = data["Close"].diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rs = gain / loss
         data["RSI"] = 100 - (100 / (1 + rs))
 
+        # EMA
         ema12 = data["Close"].ewm(span=12, adjust=False).mean()
         ema26 = data["Close"].ewm(span=26, adjust=False).mean()
+        data["EMA_12"] = ema12
+        data["EMA_26"] = ema26
+        data["EMA_Cross"] = (ema12 - ema26)  # positiv = bullish, negativ = bearish
+
+        # MACD
         data["MACD"] = ema12 - ema26
 
+        # Bollinger Bands
+        data["BB_mid"] = data["Close"].rolling(window=20).mean()
+        data["BB_std"] = data["Close"].rolling(window=20).std()
+        data["BB_upper"] = data["BB_mid"] + 2 * data["BB_std"]
+        data["BB_lower"] = data["BB_mid"] - 2 * data["BB_std"]
+
+        # Volatilitet & momentum
         data["Volatility"] = data["Close"].pct_change().rolling(20).std()
         data["Momentum"] = data["Close"].pct_change(10)
         data["Volume_trend"] = data["Volume"].pct_change().rolling(20).mean()
 
         # --- 3. Lag target (opp/ned neste dag) ---
-        data["Target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
+        fremtid = 5  # antall dager frem
+        data["Target"] = (data["Close"].shift(-fremtid) > data["Close"]).astype(int)
+
         data = data.dropna()
 
         # --- 4. Sett opp features og labels ---
-        X = data[["SMA_20", "SMA_50", "RSI", "MACD", "Volatility", "Momentum", "Volume_trend"]]
+        X = data[[
+            "SMA_20", "SMA_50", "RSI", "MACD", "Volatility",
+            "Momentum", "Volume_trend", "EMA_Cross", "BB_mid", "BB_upper", "BB_lower"
+        ]]
         y = data["Target"]
 
         # --- 5. Split data ---
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
-        # --- 6. Tren modell ---
-        model = RandomForestClassifier(n_estimators=300, random_state=42)
+        # --- 6. Tren modell (med class_weight balansert) ---
+        model = RandomForestClassifier(n_estimators=300, random_state=42, class_weight="balanced")
         model.fit(X_train, y_train)
 
         # --- 7. Evaluer ---
@@ -74,51 +95,22 @@ if st.button("Analyser"):
         st.bar_chart(importance.set_index("Feature"))
         st.table(importance)
 
-        # --- 9. AI-anbefaling for neste dag ---
+        # --- 9. AI-anbefaling for neste børsdag ---
         siste = X.iloc[[-1]]
-        sannsynlighet = model.predict_proba(siste)[0, 1]  # ✅ definert før if
-
-        from pandas.tseries.offsets import BDay
-        import datetime
+        sannsynlighet = model.predict_proba(siste)[0, 1]
 
         neste_borsdag = (datetime.date.today() + BDay(1)).date()
 
         st.subheader("🤖 AI-anbefaling")
-        st.write(f"Sannsynlighet for oppgang i {ticker} neste børsdag ({neste_borsdag}): **{sannsynlighet:.2%}**")
+        st.write(
+            f"Sannsynlighet for oppgang i {ticker} neste børsdag (**{neste_borsdag}**): "
+            f"**{sannsynlighet:.2%}**"
+        )
 
         if sannsynlighet > 0.6:
-            st.success("💚 AI sier: **KJØP**")
+            st.success("💚 AI sier: **KJØP** (modellen ser høy sannsynlighet for oppgang)")
         elif sannsynlighet < 0.4:
-            st.error("❤️ AI sier: **SELG**")
+            st.error("❤️ AI sier: **SELG** (modellen ser høy sannsynlighet for nedgang)")
         else:
-            st.warning("⚖️ AI sier: **VENT**")
+            st.warning("⚖️ AI sier: **VENT** (usikkert signal)")
 
-        # --- 10. Ekstra indikator-sjekker ---
-        rsi_verdi = float(siste["RSI"].values[0])
-        macd_verdi = float(siste["MACD"].values[0])
-        momentum_verdi = float(siste["Momentum"].values[0])
-        vol_verdi = float(siste["Volatility"].values[0])
-
-        # RSI
-        if rsi_verdi < 30:
-            st.info("📉 RSI: Oversolgt → mulig KJØP-signal")
-        elif rsi_verdi > 70:
-            st.info("📈 RSI: Overkjøpt → mulig SELG-signal")
-        else:
-            st.info("RSI: Nøytral sone")
-
-        # MACD
-        if macd_verdi > 0:
-            st.info("📊 MACD: Positiv trend")
-        else:
-            st.info("📊 MACD: Negativ trend")
-
-        # Momentum
-        if momentum_verdi > 0:
-            st.info("⚡ Momentum: Positiv siste 10 dager")
-        else:
-            st.info("⚡ Momentum: Negativ siste 10 dager")
-
-        # Volatilitet
-        if vol_verdi > 0.02:
-            st.info("🌪️ Høy volatilitet: Risikoen er større")
