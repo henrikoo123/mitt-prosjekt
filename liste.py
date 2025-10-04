@@ -65,26 +65,16 @@ if st.button("Analyser"):
         st.text(classification_report(y_test, y_pred))
 
         # --- 8. Feature importance ---
-        importance = pd.DataFrame({
-            "Feature": X.columns,
-            "Importance": model.feature_importances_
-        }).sort_values(by="Importance", ascending=False)
-
+        importance = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
         st.subheader("🔎 Viktigste indikatorer")
-        st.bar_chart(importance.set_index("Feature"))
-        st.table(importance)
+        st.bar_chart(importance)
 
         # --- 9. AI-anbefaling for neste dag ---
         siste = X.iloc[[-1]]
-        sannsynlighet = model.predict_proba(siste)[0, 1]  # ✅ definert før if
-
-        from pandas.tseries.offsets import BDay
-        import datetime
-
-        neste_borsdag = (datetime.date.today() + BDay(1)).date()
+        sannsynlighet = model.predict_proba(siste)[0, 1]
 
         st.subheader("🤖 AI-anbefaling")
-        st.write(f"Sannsynlighet for oppgang i {ticker} neste børsdag ({neste_borsdag}): **{sannsynlighet:.2%}**")
+        st.write(f"Sannsynlighet for oppgang i {ticker} i morgen: **{sannsynlighet:.2%}**")
 
         if sannsynlighet > 0.6:
             st.success("💚 AI sier: **KJØP**")
@@ -94,10 +84,10 @@ if st.button("Analyser"):
             st.warning("⚖️ AI sier: **VENT**")
 
         # --- 10. Ekstra indikator-sjekker ---
-        rsi_verdi = float(siste["RSI"].values[0])
-        macd_verdi = float(siste["MACD"].values[0])
-        momentum_verdi = float(siste["Momentum"].values[0])
-        vol_verdi = float(siste["Volatility"].values[0])
+        rsi_verdi = float(siste["RSI"].iloc[0])
+        macd_verdi = float(siste["MACD"].iloc[0])
+        momentum_verdi = float(siste["Momentum"].iloc[0])
+        vol_verdi = float(siste["Volatility"].iloc[0])
 
         # RSI
         if rsi_verdi < 30:
